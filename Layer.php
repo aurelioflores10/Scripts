@@ -23,7 +23,8 @@ class Layer
      */
 	public function afterGetProductCollection(\Magento\Catalog\Model\Layer $subject, $result)
 	{
-        $result->addAttributeToFilter('price', ['gt' => 0]);
+        $result->addAttributeToFilter('price', ['gt' => ]);
+        $result->addAttributeToFilter('')
         return $result;
 	}
 
