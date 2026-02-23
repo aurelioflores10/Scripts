@@ -1,4 +1,3 @@
-yaml
 name: Instalar Magento dos
 on: workflow_dispatch
 
