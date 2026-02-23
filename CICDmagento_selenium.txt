@@ -1,0 +1,68 @@
+yaml
+name: Magento Cloud - PR Automático Limpio
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: 'Módulo (ej: magento/module-services-id)'
+        required: true
+
+jobs:
+  ci-cd-magento:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: mariadb:10.6
+        env: { MYSQL_ROOT_PASSWORD: root, MYSQL_DATABASE: magento_ci }
+        ports: ["3306:3306"]
+      selenium:
+        image: selenium/standalone-chrome:latest
+        ports: ["4444:4444"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with: { php-version: '8.1', tools: composer } # 2.4.5 usa PHP 8.1
+
+      - name: Composer Install & Module
+        run: |
+          composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
+          composer install --no-interaction
+          composer require ${{ github.event.inputs.module }} --no-interaction
+
+      - name: Magento Mini-Install (El Cascarón)
+        run: |
+          bin/magento setup:install \
+            --db-host=127.0.0.1 --db-name=magento_ci --db-user=root --db-password=root \
+            --base-url=http://127.0.0.1 --admin-user=admin --admin-password=Password123 \
+            --admin-email=admin@test.com --admin-firstname=Admin --admin-lastname=Admin
+
+      - name: Run Selenium Test
+        run: |
+          php -S 127.0.0.1:8080 -t pub/ &
+          sleep 5
+          cp dev/tests/acceptance/.env.example dev/tests/acceptance/.env
+          sed -i 's|MAGENTO_BASE_URL=https://magento.test|MAGENTO_BASE_URL=http://127.0.0.1|g' dev/tests/acceptance/.env
+          vendor/bin/mftf build:project
+          vendor/bin/mftf run:test VerificarCarritoDespuesDeModulo
+
+      - name: 🧹 Limpieza Post-Install (Anti-Basura)
+        run: |
+          # Regresamos todo a su estado original excepto composer
+          git checkout -- .
+          # Borramos el env.php y carpetas generadas para que NO entren al PR
+          rm -rf app/etc/env.php generated/ var/ pub/static/
+          git clean -fd
+
+      - name: 🚀 Crear PR (Solo Composer)
+        if: success()
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: "update-${{ github.run_id }}"
+          title: "PR: Instalación ${{ github.event.inputs.module }}"
+          add-paths: |
+            composer.json
+            composer.lock
