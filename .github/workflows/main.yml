@@ -1,5 +1,5 @@
 yaml
-name: Didáctico - Instalar Magento 2.4.5
+name: Instalar Magento dos
 on: workflow_dispatch
 
 jobs:
