@@ -13,28 +13,30 @@ jobs:
           MYSQL_DATABASE: magento_245
         ports:
           - 3306:3306
-        # Este health check asegura que la DB esté lista antes de empezar el setup
         options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
 
     steps:
       - uses: actions/checkout@v4
 
-      # PASO 1: PHP SIEMPRE PRIMERO (Para que Composer no use la versión del sistema)
       - name: 1. Configurar PHP 8.1
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
-          # Agregamos sockets y mbstring, vitales para Magento 2.4.5
           extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring
           tools: composer:v2
 
-      # PASO 2: CREAR EL PROYECTO (Con el punto al final para instalar en la raíz)
       - name: 2. Crear proyecto desde cero
         run: |
+          # Configurar credenciales de Magento
           composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
+          
+          # ELIMINAR ARCHIVOS EXISTENTES (como la carpeta .git del checkout)
+          # Esto deja el directorio vacío para que Composer no falle
+          rm -rf ./* ./.* 2>/dev/null || true
+          
+          # Instalar Magento en la raíz actual (.)
           composer create-project --repository-url=https://repo.magento.com magento/project-community-edition=2.4.5 . --no-interaction --prefer-dist
 
-      # PASO 3: INSTALACIÓN DE TABLAS (Usando 127.0.0.1 para evitar líos de DNS)
       - name: 3. Setup Install (Crear Tablas)
         run: |
           bin/magento setup:install \
@@ -50,7 +52,6 @@ jobs:
             --admin-lastname=Z \
             --use-rewrites=1
 
-      # PASO 4: VERIFICACIÓN FINAL
       - name: 4. Verificar Exito
         run: |
           echo "### ESTADO DE MODULOS ###"
