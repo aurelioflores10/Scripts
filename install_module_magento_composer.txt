@@ -1,0 +1,59 @@
+yaml
+name: Magento Cloud - Install Module PR
+on:
+  workflow_dispatch:
+    inputs:
+      module_name:
+        description: 'Módulo a instalar (ej: magento/module-services-id)'
+        required: true
+
+jobs:
+  install_and_pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP 8.1
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1' # Versión estándar para Magento 2.4.5 / Cloud
+          tools: composer
+
+      # 1. AUTENTICACIÓN (Vital para el Repo de Adobe)
+      - name: Composer Auth
+        run: |
+          composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
+
+      # 2. INSTALACIÓN "LIMPIA" (Sin disparar scripts de Magento que ensucian)
+      - name: Composer Install & Require
+        run: |
+          # Instalamos dependencias actuales sin ejecutar scripts de Magento (evita generated/ y var/)
+          composer install --no-interaction --no-scripts --no-autoloader
+          # Agregamos el módulo nuevo
+          composer require ${{ github.event.inputs.module_name }} --no-interaction --no-scripts
+
+      # 3. EL FILTRO ANTI-ADAME (Asegurar que nada extra se coló)
+      - name: 🧹 Limpieza de Seguridad
+        run: |
+          # Regresamos cualquier archivo de Magento modificado a su estado original
+          git checkout -- .
+          # Borramos cualquier archivo huérfano (generated, var, etc.)
+          git clean -fd
+
+      # 4. GENERAR EL PR (Solo JSON y LOCK)
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: install ${{ github.event.inputs.module_name }}"
+          title: "Install Module: ${{ github.event.inputs.module_name }}"
+          body: |
+            Instalación automática del módulo mediante CI.
+            - Ejecutado con `--no-scripts` para mantener el PR limpio.
+            - Validado por GitHub Actions.
+          branch: "feat/install-${{ github.run_id }}"
+          base: dev
+          # EL CANDADO MAESTRO: Solo estos dos archivos pasan al PR
+          add-paths: |
+            composer.json
+            composer.lock
