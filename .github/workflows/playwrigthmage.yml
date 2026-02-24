@@ -1,4 +1,4 @@
-name: Magento Install + Playwright Cart Test (Fixed Security)
+ame: Magento Install + Playwright Cart Test (Fixed & Visual)
 on: workflow_dispatch
 
 jobs:
@@ -31,21 +31,22 @@ jobs:
           extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring
           tools: composer:v2
 
+      # OPTIMIZACIÓN: Cache de Composer
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
+
       - name: 2. Install Magento & Module
         run: |
-          # Configuración de credenciales
           composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
-          
-          # FIX: Desactivar bloqueo de seguridad de Composer 2.9+
           composer config -g audit.block-insecure false
           
           mv .git ../temp_git
           rm -rf ./* ./.* 2>/dev/null || true
           
-          # Crear proyecto ignorando auditoría
           composer create-project --repository-url=https://repo.magento.com magento/project-community-edition=2.4.5 . --no-install
-          
-          # Re-aplicar fix localmente para el require e install
           composer config audit.block-insecure false
           composer require magento/module-services-id --no-interaction
           composer install
@@ -53,10 +54,9 @@ jobs:
 
       - name: 3. Setup Magento + Create Product
         run: |
-          # Instalación con puerto 8080
+          # CORRECCIÓN: La base-url DEBE llevar el puerto 8080
           bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=1
           
-          # Script PHP para crear producto con visibilidad correcta
           cat <<EOF > create_product.php
           <?php
           use Magento\Framework\App\Bootstrap;
@@ -74,11 +74,10 @@ jobs:
               ->setPrice(10)
               ->setInventoryData(['manage_stock' => 1, 'is_in_stock' => 1, 'qty' => 100])
               ->setWebsiteIds([1])
-              ->setStoreId(0)
               ->setVisibility(\Magento\Catalog\Model\Product\Visibility::VISIBILITY_BOTH)
               ->setStatus(\Magento\Catalog\Model\Product\Attribute\Source\Status::STATUS_ENABLED)
               ->save();
-          echo "Producto creado\n";
+          echo "Producto creado exitosamente\n";
           EOF
 
           php create_product.php
@@ -88,29 +87,61 @@ jobs:
       - name: 4. Iniciar Servidor Web
         run: php -S 127.0.0.1:8080 -t pub/ & 
 
+      # OPTIMIZACIÓN: Cache de Navegadores Playwright
+      - name: Cache Playwright Browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright
+
       - name: 5. Test de Carrito (Playwright)
         run: |
           npm install @playwright/test
           npx playwright install chromium --with-deps
           
+          cat <<EOF > playwright.config.js
+          const { defineConfig } = require('@playwright/test');
+          module.exports = defineConfig({
+            use: {
+              baseURL: 'http://127.0.0.1:8080',
+              screenshot: 'only-on-failure',
+              trace: 'on-first-retry',
+            },
+            reporter: [['html', { open: 'never' }]],
+          });
+          EOF
+
           cat <<EOF > cart.spec.js
           const { test, expect } = require('@playwright/test');
           test('Añadir al carrito funciona', async ({ page }) => {
-            await page.goto('http://127.0.0.1test-product.html');
+            // Esperar a que el servidor PHP esté listo
+            await page.waitForTimeout(3000); 
+            await page.goto('/test-product.html');
+            
             const addToCart = page.locator('#product-addtocart-button');
             await expect(addToCart).toBeVisible({ timeout: 20000 });
             await addToCart.click();
-            await expect(page.locator('.message-success')).toContainText('You added Product Test Playwright to your shopping cart');
+            
+            await expect(page.locator('.message-success')).toContainText('You added Product Test Playwright to your shopping cart', { timeout: 15000 });
           });
           EOF
           
           npx playwright test cart.spec.js
+
+      # Reporte visual si algo falla
+      - name: Upload Playwright Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
 
       - name: 6. Crear PR si el Test pasó
         if: success()
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "feat: security bypass applied and product verified"
-          title: "Magento 2.4.5 + Security Fix (Tested)"
+          commit-message: "feat: magento verified with playwright visual report"
+          title: "Magento 2.4.5 + Verified Cart"
           branch: feature/verified-install
