@@ -1,4 +1,4 @@
-name: Magento Install + Playwright Final Fix
+name: Magento Install + Playwright Final Fix v10
 on: workflow_dispatch
 
 jobs:
@@ -32,20 +32,26 @@ jobs:
           php-version: '8.1'
           extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring, iconv
           tools: composer:v2
+          ini-values: memory_limit=2G, max_execution_time=600
 
-      - name: 2. Install Magento Core
+      - name: 2. Install Magento Core (Limpieza Total)
         run: |
           composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
-          # Mover .git para que composer create-project no se queje de directorio no vacío
+          # Mover .git para no perder el historial
           mv .git ../temp_git
+          # BORRADO RADICAL: Elimina TODO (incluyendo archivos ocultos como .github o .gitignore)
+          find . -mindepth 1 -delete
+          # Ahora el directorio está 100% vacío para Composer
           composer create-project --repository-url=https://repo.magento.com magento/project-community-edition=2.4.5 . --no-install
           composer install --no-interaction --prefer-dist
+          # Restaurar .git y dar permisos
           mv ../temp_git .git
+          chmod +x bin/magento
           rm -rf dev/tests
 
       - name: 3. Setup Magento + Create Product
         run: |
-          # Instalación sin rewrites para evitar problemas con el servidor de PHP
+          # Instalación con puerto 8080 y sin rewrites
           bin/magento setup:install \
             --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root \
             --base-url=http://127.0.0.1 --search-engine=elasticsearch7 \
@@ -53,7 +59,6 @@ jobs:
             --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com \
             --admin-firstname=Admin --admin-lastname=User --use-rewrites=0
           
-          # Script para crear el producto directamente
           cat <<EOF > create_product.php
           <?php
           use Magento\Framework\App\Bootstrap;
@@ -72,51 +77,49 @@ jobs:
           bin/magento indexer:reindex
           bin/magento cache:flush
 
-      - name: 4. Iniciar Servidor Web (Modo Supervivencia)
+      - name: 4. Iniciar Servidor Web
         run: |
-          # Usamos el router de Magento para que los archivos estáticos carguen
+          # Usamos el ruteador oficial de Magento para que carguen CSS/JS
           nohup php -S 127.0.0.1:8080 -t pub/ phpserver/router.php > php.log 2>&1 &
-          # Esperar a que el servidor responda
-          timeout 60s bash -c 'until curl -s http://127.0.0.1:8080 > /dev/null; do sleep 2; done'
+          # Esperar a que el servidor responda (el primer hit de Magento es eterno)
+          timeout 120s bash -c 'until curl -s http://127.0.0.1index.php/test-product.html > /dev/null; do sleep 5; done'
 
       - name: 5. Test de Carrito (Playwright)
         run: |
           npm init -y
           npm install @playwright/test
-          # Instalamos SOLO chromium para evitar el apt-get upgrade masivo
           npx playwright install chromium
           
           cat <<EOF > playwright.config.js
           const { defineConfig } = require('@playwright/test');
           module.exports = defineConfig({
             use: { baseURL: 'http://127.0.0.1:8080', screenshot: 'on' },
-            timeout: 120000,
+            timeout: 180000,
           });
           EOF
 
           cat <<EOF > cart.spec.js
           const { test, expect } = require('@playwright/test');
-          test('Añadir al carrito', async ({ page }) => {
-            // Magento es lento en el primer render, esperamos con paciencia
+          test('Añadir al carrito funciona', async ({ page }) => {
             await page.goto('/index.php/test-product.html', { waitUntil: 'networkidle', timeout: 90000 });
             const btn = page.locator('#product-addtocart-button');
-            await expect(btn).toBeVisible();
+            await expect(btn).toBeVisible({ timeout: 30000 });
             await btn.click();
-            await expect(page.locator('.message-success')).toBeVisible({ timeout: 20000 });
+            await expect(page.locator('.message-success')).toBeVisible({ timeout: 30000 });
           });
           EOF
           
           npx playwright test cart.spec.js
 
-      - name: Upload Logs & Report
+      - name: Upload Debug Info
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-info
+          name: debug-results
           path: |
             playwright-report/
             php.log
-            test-results/
+            var/log/
 
       - name: 6. Crear PR si pasó el test
         if: success()
