@@ -1,4 +1,4 @@
-name: Magento Install + Playwright Final Fix
+name: Magento Install + Playwright Final Fix (No More 404)
 on: workflow_dispatch
 
 jobs:
@@ -43,14 +43,12 @@ jobs:
           composer config audit.block-insecure false
           composer install --no-interaction
           mv ../temp_git .git
-          
-          # SOLUCIÓN AL ERROR 'define': Borrar tests internos de Jasmine que Playwright intenta correr
           rm -rf dev/tests
 
-      - name: 3. Setup Magento + Create Product (Fix Stock & Visibilidad)
+      - name: 3. Setup Magento + Create Product (Fix URL & Stock)
         run: |
-          # CORRECCIÓN: La base-url DEBE incluir el puerto 8080 para que Magento no redirija a la nada
-          bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=1
+          # IMPORTANTE: base-url con puerto 8080 y barra final
+          bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=0
           
           cat <<EOF > create_product.php
           <?php
@@ -64,6 +62,7 @@ jobs:
           \$product = \$objectManager->create(\Magento\Catalog\Model\Product::class);
           \$product->setSku('test-product')
               ->setName('Product Test Playwright')
+              ->setUrlKey('test-product') // Fuerza el slug para evitar 404
               ->setTypeId('simple')
               ->setAttributeSetId(4)
               ->setPrice(10)
@@ -72,30 +71,27 @@ jobs:
               ->setVisibility(4)
               ->setStatus(1)
               ->save();
-          echo "Producto creado y con stock verificado\n";
+          echo "Producto creado con URL Key: test-product\n";
           EOF
           php create_product.php
           bin/magento indexer:reindex
           bin/magento cache:flush
 
       - name: 4. Iniciar Servidor Web
-        run: php -S 127.0.0.1:8080 -t pub/ & 
+        run: |
+          php -S 127.0.0.1:8080 -t pub/ & 
+          timeout 60s bash -c 'until curl -s http://127.0.0.1index.php > /dev/null; do sleep 2; done'
 
-      - name: 5. Test de Carrito (Playwright Light)
+      - name: 5. Test de Carrito (Fix URL Rewrites)
         run: |
           npm install @playwright/test
-          # OPTIMIZACIÓN: Solo Chromium para evitar descargas de fuentes innecesarias
           npx playwright install chromium --with-deps
           
           cat <<EOF > playwright.config.js
           const { defineConfig } = require('@playwright/test');
           module.exports = defineConfig({
             testMatch: 'cart.spec.js',
-            use: { 
-              baseURL: 'http://127.0.0.1:8080',
-              screenshot: 'on',
-              video: 'on'
-            },
+            use: { baseURL: 'http://127.0.0.1:8080', screenshot: 'on', video: 'on' },
             reporter: [['html', { open: 'never' }]],
           });
           EOF
@@ -103,20 +99,19 @@ jobs:
           cat <<EOF > cart.spec.js
           const { test, expect } = require('@playwright/test');
           test('Añadir al carrito funciona', async ({ page }) => {
-            // Aumentamos el timeout a 120s para compensar la carga lenta en el runner
-            await page.goto('/test-product.html', { waitUntil: 'networkidle', timeout: 120000 });
+            // FIX: Usamos /index.php/ delante para evitar el error 404 del servidor PHP embebido
+            await page.goto('/index.php/test-product.html', { waitUntil: 'networkidle', timeout: 90000 });
             
             const addToCart = page.locator('#product-addtocart-button');
-            await expect(addToCart).toBeVisible({ timeout: 60000 });
+            await expect(addToCart).toBeVisible({ timeout: 40000 });
             await addToCart.click();
             
             const success = page.locator('.message-success');
-            await expect(success).toBeVisible({ timeout: 30000 });
+            await expect(success).toBeVisible({ timeout: 20000 });
             await expect(success).toContainText('You added Product Test Playwright');
           });
           EOF
           
-          # Ejecución con timeout extendido para todo el test
           npx playwright test cart.spec.js --timeout=120000
 
       - name: Upload Playwright Report
@@ -126,10 +121,10 @@ jobs:
           name: playwright-report
           path: playwright-report/
 
-      - name: 6. Crear PR si pasó el test
+      - name: 6. Crear PR
         if: success()
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          title: "Magento 2.4.5: Verified via Playwright"
+          title: "Magento Verified: Product & Cart"
           branch: feature/verified-install
