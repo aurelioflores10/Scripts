@@ -5,6 +5,11 @@ jobs:
   install-and-pr:
     runs-on: ubuntu-latest
     
+    # Permisos necesarios para que el script pueda crear el Pull Request
+    permissions:
+      contents: write
+      pull-requests: write
+    
     services:
       db:
         image: mariadb:10.4
@@ -27,6 +32,8 @@ jobs:
     steps:
       - name: Checkout del repositorio
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Traemos toda la historia para evitar líos con el PR
 
       - name: 1. Configurar PHP 8.1
         uses: shivammathur/setup-php@v2
@@ -37,18 +44,23 @@ jobs:
 
       - name: 2. Crear proyecto y Agregar Modulo
         run: |
+          # Configurar credenciales
           composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
           composer config -g audit.block-insecure false
           
-          # LIMPIEZA INTELIGENTE: Borramos todo MENOS la carpeta .git para poder hacer el PR
-          find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} +
+          # EL BAILE DEL .GIT: Lo movemos para que Composer vea la carpeta vacía
+          mv .git ../temp_git
+          rm -rf ./* ./.* 2>/dev/null || true
           
-          # Instalar Magento
+          # Instalar Magento 2.4.5
           composer create-project --repository-url=https://repo.magento.com \
             magento/project-community-edition=2.4.5 . \
             --no-interaction --prefer-dist --no-audit
           
-          # INSTALAR EL MODULO QUE PEDISTE
+          # REGRESAMOS .git a su lugar original
+          mv ../temp_git .git
+          
+          # Instalamos el módulo que pediste
           composer require magento/module-services-id --no-interaction --no-audit
 
       - name: 3. Setup Install (Crear Tablas)
@@ -70,14 +82,17 @@ jobs:
             --elasticsearch-port=9200 \
             --cleanup-database
 
-      - name: 4. Crear Pull Request con cambios de Composer
+      - name: 4. Crear Pull Request con cambios
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: add magento/module-services-id"
-          title: "Instalación de Magento 2.4.5 + Services ID"
-          body: "Este PR fue generado automáticamente. Incluye el composer.json y composer.lock con el nuevo módulo."
-          branch: feature/magento-install-services-id
-          add-paths: |
-            composer.json
-            composer.lock
+          commit-message: "chore: install magento 2.4.5 and module-services-id"
+          title: "Instalación Automática: Magento 2.4.5 + Services ID"
+          body: |
+            Este PR fue generado por un GitHub Action.
+            - Instalación base de Magento 2.4.5.
+            - Módulo `magento/module-services-id` agregado.
+            - Base de Datos MariaDB 10.4 y Elasticsearch 7.17 verificados.
+          branch: feature/magento-auto-install
+          base: main # O master, según el nombre de tu rama principal
+          delete-branch: true
