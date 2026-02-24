@@ -1,4 +1,4 @@
-name: Instalar Magento tres
+name: Instalar Magento Full opensource
 on: workflow_dispatch
 
 jobs:
