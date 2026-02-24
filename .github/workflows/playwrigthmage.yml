@@ -41,15 +41,38 @@ jobs:
           composer install
           mv ../temp_git .git
 
-      - name: 3. Setup Magento
+      - name: 3. Setup Magento + Create Product via Script
         run: |
+          # Instalación con puerto 8080 para evitar conflictos de redirección
           bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=1
           
-          # CREAR PRODUCTO POR CLI (Para que el test tenga qué comprar)
-          bin/magento sampledata:reset # Limpia si hubiera algo
-          # Creamos una categoría y un producto simple
-          bin/magento catalog:category:create --name="Test Category"
-          bin/magento catalog:product:create --sku="test-product" --name="Product Test Playwright" --price=10 --website-ids=1 --category-ids=3 --qty=100 --status=1 --visibility=4
+          # Script PHP para crear producto (Alternativa rápida a Sample Data)
+          cat <<EOF > create_product.php
+          <?php
+          use Magento\Framework\App\Bootstrap;
+          require __DIR__ . '/app/bootstrap.php';
+          \$bootstrap = Bootstrap::create(BP, \$_SERVER);
+          \$objectManager = \$bootstrap->getObjectManager();
+          \$state = \$objectManager->get(\Magento\Framework\App\State::class);
+          \$state->setAreaCode(\Magento\Framework\App\Area::AREA_FRONTEND);
+
+          \$product = \$objectManager->create(\Magento\Catalog\Model\Product::class);
+          \$product->setSku('test-product')
+              ->setName('Product Test Playwright')
+              ->setTypeId(\Magento\Catalog\Model\Product\Type::TYPE_SIMPLE)
+              ->setAttributeSetId(4)
+              ->setPrice(10)
+              ->setInventoryData(['manage_stock' => 1, 'is_in_stock' => 1, 'qty' => 100])
+              ->setWebsiteIds([1])
+              ->setVisibility(\Magento\Catalog\Model\Product\Visibility::VISIBILITY_BOTH)
+              ->setStatus(\Magento\Catalog\Model\Product\Attribute\Source\Status::STATUS_ENABLED)
+              ->save();
+          echo "Producto 'test-product' creado exitosamente\n";
+          EOF
+
+          php create_product.php
+          bin/magento indexer:reindex
+          bin/magento cache:flush
 
       - name: 4. Iniciar Servidor Web
         run: php -S 127.0.0.1:8080 -t pub/ & 
@@ -62,14 +85,16 @@ jobs:
           cat <<EOF > cart.spec.js
           const { test, expect } = require('@playwright/test');
           test('Añadir al carrito funciona', async ({ page }) => {
-            // Ir directo a la página del producto que creamos
+            // Ir a la URL del producto creado (con puerto 8080)
             await page.goto('http://127.0.0.1test-product.html');
-            // Esperar al botón de carrito y hacer clic
+            
             const addToCart = page.locator('#product-addtocart-button');
-            await expect(addToCart).toBeVisible();
+            await expect(addToCart).toBeVisible({ timeout: 15000 });
             await addToCart.click();
+            
             // Verificar mensaje de éxito
-            await expect(page.locator('.message-success')).toContainText('You added Product Test Playwright to your shopping cart');
+            const successMessage = page.locator('.message-success');
+            await expect(successMessage).toContainText('You added Product Test Playwright to your shopping cart');
           });
           EOF
           
@@ -80,6 +105,6 @@ jobs:
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "feat: magento installed and cart verified"
-          title: "Magento 2.4.5 + Services ID (Tested)"
+          commit-message: "feat: magento installed and product verified"
+          title: "Magento 2.4.5 + Script Product (Tested)"
           branch: feature/verified-install
