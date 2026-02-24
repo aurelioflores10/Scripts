@@ -44,12 +44,12 @@ jobs:
           composer install --no-interaction
           mv ../temp_git .git
           
-          # LIMPIEZA: Evitar error 'define is not defined' eliminando tests de Jasmine
+          # SOLUCIÓN AL ERROR 'define': Borrar tests internos de Jasmine que Playwright intenta correr
           rm -rf dev/tests
 
       - name: 3. Setup Magento + Create Product (Fix Stock & Visibilidad)
         run: |
-          # CORRECCIÓN: La base-url DEBE incluir el puerto 8080 para que el servidor responda
+          # CORRECCIÓN: La base-url DEBE incluir el puerto 8080 para que Magento no redirija a la nada
           bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=1
           
           cat <<EOF > create_product.php
@@ -84,7 +84,7 @@ jobs:
       - name: 5. Test de Carrito (Playwright Light)
         run: |
           npm install @playwright/test
-          # EVITA LAS FUENTES: Solo instala el binario de Chromium y sus dependencias mínimas
+          # OPTIMIZACIÓN: Solo Chromium para evitar descargas de fuentes innecesarias
           npx playwright install chromium --with-deps
           
           cat <<EOF > playwright.config.js
