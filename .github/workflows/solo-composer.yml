@@ -1,0 +1,62 @@
+name: Generar Composer Magento y Modulo
+on: workflow_dispatch
+
+jobs:
+  solo-composer:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 1. Configurar PHP 8.1
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          tools: composer:v2
+
+      - name: 2. Generar Archivos Composer
+        run: |
+          # 1. Configurar credenciales
+          composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
+          composer config -g audit.block-insecure false
+          
+          # 2. BAILE DEL .GIT (Para que la carpeta esté vacía)
+          mv .git ../temp_git
+          rm -rf ./* ./.* 2>/dev/null || true
+          
+          # 3. CREAR PROYECTO SIN INSTALAR (Solo genera el composer.json oficial)
+          # El flag --no-install es la clave aquí
+          composer create-project --repository-url=https://repo.magento.com \
+            magento/project-community-edition=2.4.5 . \
+            --no-interaction --no-install --no-audit
+          
+          # 4. REGRESAR .GIT
+          mv ../temp_git .git
+          
+          # 5. AGREGAR EL MÓDULO (Esto actualiza el json y el lock)
+          composer require magento/module-services-id --no-interaction --no-audit
+
+      - name: 3. Crear Pull Request Limpio
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: add magento 2.4.5 composer files and services-id"
+          title: "Configuración Composer: Magento 2.4.5 + Services ID"
+          body: |
+            Este PR solo contiene los archivos de configuración:
+            - `composer.json` (oficial de Magento 2.4.5 + modulo)
+            - `composer.lock`
+            No incluye el código fuente (vendor/app) para mantener el PR limpio.
+          branch: feature/solo-composer-config
+          base: master
+          delete-branch: true
+          add-paths: |
+            composer.json
+            composer.lock
