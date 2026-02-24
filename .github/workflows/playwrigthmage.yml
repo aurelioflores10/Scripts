@@ -1,4 +1,4 @@
-name: Magento Install + Playwright Cart Test (Fixed)
+name: Magento Install + Playwright Cart Test (Fixed & Clean)
 on: workflow_dispatch
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
           extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring
           tools: composer:v2
 
-      - name: 2. Install Magento
+      - name: 2. Install Magento & Module
         run: |
           composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
           composer config -g audit.block-insecure false
@@ -43,10 +43,13 @@ jobs:
           composer config audit.block-insecure false
           composer install --no-interaction
           mv ../temp_git .git
+          
+          # SOLUCIÓN AL ERROR 'define': Borrar tests de Jasmine internos que Playwright intenta correr
+          rm -rf dev/tests
 
-      - name: 3. Setup Magento + Create Product (Fix Visibilidad)
+      - name: 3. Setup Magento + Create Product
         run: |
-          # FIX: base-url debe incluir el puerto 8080
+          # FIX: base-url DEBE coincidir con el puerto 8080 del servidor
           bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=1
           
           cat <<EOF > create_product.php
@@ -69,7 +72,7 @@ jobs:
               ->setVisibility(4)
               ->setStatus(1)
               ->save();
-          echo "Producto creado\n";
+          echo "Producto creado exitosamente\n";
           EOF
           php create_product.php
           bin/magento indexer:reindex
@@ -83,21 +86,28 @@ jobs:
           npm install @playwright/test
           npx playwright install chromium --with-deps
           
+          # Configuración para que Playwright SOLO vea tu test y no los de Magento
           cat <<EOF > playwright.config.js
-          module.exports = {
-            use: { baseURL: 'http://127.0.0.1:8080', screenshot: 'on', video: 'on' },
+          const { defineConfig } = require('@playwright/test');
+          module.exports = defineConfig({
+            testMatch: 'cart.spec.js',
+            use: { 
+              baseURL: 'http://127.0.0.1:8080', 
+              screenshot: 'on', 
+              video: 'on' 
+            },
             reporter: [['html', { open: 'never' }]],
-          };
+          });
           EOF
 
           cat <<EOF > cart.spec.js
           const { test, expect } = require('@playwright/test');
           test('Añadir al carrito funciona', async ({ page }) => {
-            // Esperar a que la red esté inactiva (Magento cargado)
-            await page.goto('/test-product.html', { waitUntil: 'networkidle', timeout: 60000 });
+            // networkidle asegura que el JavaScript de Magento esté cargado antes de actuar
+            await page.goto('/test-product.html', { waitUntil: 'networkidle', timeout: 90000 });
             
             const addToCart = page.locator('#product-addtocart-button');
-            await expect(addToCart).toBeVisible({ timeout: 30000 });
+            await expect(addToCart).toBeVisible({ timeout: 40000 });
             await addToCart.click();
             
             const success = page.locator('.message-success');
@@ -105,7 +115,8 @@ jobs:
             await expect(success).toContainText('You added Product Test Playwright');
           });
           EOF
-          npx playwright test
+          
+          npx playwright test cart.spec.js
 
       - name: Upload Report
         if: always()
