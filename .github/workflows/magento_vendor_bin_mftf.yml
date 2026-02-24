@@ -1,0 +1,84 @@
+name: Magento 2.4.5 + MFTF Test
+on: workflow_dispatch
+
+jobs:
+  mftf-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      db:
+        image: mariadb:10.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: magento_245
+        ports: ["3306:3306"]
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+        env:
+          discovery.type: single-node
+        ports: ["9200:9200"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 1. Setup PHP & Selenium
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring
+          tools: composer:v2
+
+      - name: 2. Install Magento
+        run: |
+          composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
+          mv .git ../temp_git
+          rm -rf ./* ./.* 2>/dev/null || true
+          composer create-project --repository-url=https://repo.magento.com magento/project-community-edition=2.4.5 . --no-install
+          composer require magento/module-services-id --no-interaction
+          composer install
+          mv ../temp_git .git
+          
+          # Instalación de BD
+          bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=1
+
+      - name: 3. Configurar MFTF (.env)
+        run: |
+          # Copiar ejemplo y editar variables básicas
+          cp dev/tests/acceptance/.env.example dev/tests/acceptance/.env
+          sed -i 's|MAGENTO_BASE_URL=http://magento.test|MAGENTO_BASE_URL=http://127.0.0.1|g' dev/tests/acceptance/.env
+          sed -i 's|MAGENTO_ADMIN_USERNAME=admin|MAGENTO_ADMIN_USERNAME=admin|g' dev/tests/acceptance/.env
+          sed -i 's|MAGENTO_ADMIN_PASSWORD=123123q|MAGENTO_ADMIN_PASSWORD=Password123|g' dev/tests/acceptance/.env
+          # Forzar a que use Selenium en el puerto estándar
+          echo "SELENIUM_HOST=127.0.0.1" >> dev/tests/acceptance/.env
+          echo "SELENIUM_PORT=4444" >> dev/tests/acceptance/.env
+
+      - name: 4. Build MFTF Project
+        run: vendor/bin/mftf build:project
+
+      - name: 5. Levantar Entorno de Pruebas (Web + Selenium)
+        run: |
+          # Servidor Web
+          php -S 127.0.0.1:8080 -t pub/ & 
+          # Selenium (Usamos una imagen ligera de standalone-chrome en el Runner)
+          sudo apt-get update && sudo apt-get install -y chromium-browser
+          # En GitHub Actions es más fácil usar una Action de Selenium ya lista:
+          
+      - name: 6. Run Selenium Solo
+        uses: nttld/setup-headless-selenium-action@v1
+        with:
+          selenium-version: '3.141.59'
+
+      - name: 7. Ejecutar Test de Carrito (MFTF)
+        run: |
+          # Ejecutamos solo el test de "Add Product to Cart" para no tardar horas
+          vendor/bin/mftf run:test StorefrontAddProductToCartTest
+
+      - name: 8. Crear PR
+        if: success()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: magento verified with MFTF"
+          title: "Magento 2.4.5 + Services ID (MFTF Verified)"
+          branch: feature/mftf-verified
