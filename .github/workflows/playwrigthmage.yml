@@ -1,4 +1,4 @@
-ame: Magento Install + Playwright Cart Test (Fixed & Visual)
+name: Magento Install + Playwright Cart Test (Fixed & Visual)
 on: workflow_dispatch
 
 jobs:
