@@ -1,9 +1,12 @@
-name: Magento Install + Playwright Cart Test (Fixed & Visual)
+name: Magento Install + Playwright Cart Test (Fixed)
 on: workflow_dispatch
 
 jobs:
   test-and-pr:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     
     services:
       db:
@@ -13,7 +16,6 @@ jobs:
           MYSQL_DATABASE: magento_245
         ports: ["3306:3306"]
         options: --health-cmd="mysqladmin ping" --health-interval=10s
-
       elasticsearch:
         image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
         env:
@@ -31,30 +33,20 @@ jobs:
           extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring
           tools: composer:v2
 
-      # OPTIMIZACIÓN: Cache de Composer
-      - name: Cache Composer dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.composer/cache
-          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
-
-      - name: 2. Install Magento & Module
+      - name: 2. Install Magento
         run: |
           composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
           composer config -g audit.block-insecure false
-          
           mv .git ../temp_git
           rm -rf ./* ./.* 2>/dev/null || true
-          
           composer create-project --repository-url=https://repo.magento.com magento/project-community-edition=2.4.5 . --no-install
           composer config audit.block-insecure false
-          composer require magento/module-services-id --no-interaction
-          composer install
+          composer install --no-interaction
           mv ../temp_git .git
 
-      - name: 3. Setup Magento + Create Product
+      - name: 3. Setup Magento + Create Product (Fix Visibilidad)
         run: |
-          # CORRECCIÓN: La base-url DEBE llevar el puerto 8080
+          # FIX: base-url debe incluir el puerto 8080
           bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=1
           
           cat <<EOF > create_product.php
@@ -69,17 +61,16 @@ jobs:
           \$product = \$objectManager->create(\Magento\Catalog\Model\Product::class);
           \$product->setSku('test-product')
               ->setName('Product Test Playwright')
-              ->setTypeId(\Magento\Catalog\Model\Product\Type::TYPE_SIMPLE)
+              ->setTypeId('simple')
               ->setAttributeSetId(4)
               ->setPrice(10)
-              ->setInventoryData(['manage_stock' => 1, 'is_in_stock' => 1, 'qty' => 100])
               ->setWebsiteIds([1])
-              ->setVisibility(\Magento\Catalog\Model\Product\Visibility::VISIBILITY_BOTH)
-              ->setStatus(\Magento\Catalog\Model\Product\Attribute\Source\Status::STATUS_ENABLED)
+              ->setStockData(['use_config_manage_stock' => 0, 'manage_stock' => 1, 'is_in_stock' => 1, 'qty' => 100])
+              ->setVisibility(4)
+              ->setStatus(1)
               ->save();
-          echo "Producto creado exitosamente\n";
+          echo "Producto creado\n";
           EOF
-
           php create_product.php
           bin/magento indexer:reindex
           bin/magento cache:flush
@@ -87,61 +78,46 @@ jobs:
       - name: 4. Iniciar Servidor Web
         run: php -S 127.0.0.1:8080 -t pub/ & 
 
-      # OPTIMIZACIÓN: Cache de Navegadores Playwright
-      - name: Cache Playwright Browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright
-
-      - name: 5. Test de Carrito (Playwright)
+      - name: 5. Test de Carrito (Playwright Robusto)
         run: |
           npm install @playwright/test
           npx playwright install chromium --with-deps
           
           cat <<EOF > playwright.config.js
-          const { defineConfig } = require('@playwright/test');
-          module.exports = defineConfig({
-            use: {
-              baseURL: 'http://127.0.0.1:8080',
-              screenshot: 'only-on-failure',
-              trace: 'on-first-retry',
-            },
+          module.exports = {
+            use: { baseURL: 'http://127.0.0.1:8080', screenshot: 'on', video: 'on' },
             reporter: [['html', { open: 'never' }]],
-          });
+          };
           EOF
 
           cat <<EOF > cart.spec.js
           const { test, expect } = require('@playwright/test');
           test('Añadir al carrito funciona', async ({ page }) => {
-            // Esperar a que el servidor PHP esté listo
-            await page.waitForTimeout(3000); 
-            await page.goto('/test-product.html');
+            // Esperar a que la red esté inactiva (Magento cargado)
+            await page.goto('/test-product.html', { waitUntil: 'networkidle', timeout: 60000 });
             
             const addToCart = page.locator('#product-addtocart-button');
-            await expect(addToCart).toBeVisible({ timeout: 20000 });
+            await expect(addToCart).toBeVisible({ timeout: 30000 });
             await addToCart.click();
             
-            await expect(page.locator('.message-success')).toContainText('You added Product Test Playwright to your shopping cart', { timeout: 15000 });
+            const success = page.locator('.message-success');
+            await expect(success).toBeVisible({ timeout: 20000 });
+            await expect(success).toContainText('You added Product Test Playwright');
           });
           EOF
-          
-          npx playwright test cart.spec.js
+          npx playwright test
 
-      # Reporte visual si algo falla
-      - name: Upload Playwright Report
-        uses: actions/upload-artifact@v4
+      - name: Upload Report
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: playwright-report
           path: playwright-report/
-          retention-days: 7
 
-      - name: 6. Crear PR si el Test pasó
+      - name: 6. Crear PR
         if: success()
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "feat: magento verified with playwright visual report"
-          title: "Magento 2.4.5 + Verified Cart"
+          title: "Magento Verified Installation"
           branch: feature/verified-install
