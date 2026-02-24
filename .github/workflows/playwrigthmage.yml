@@ -43,11 +43,12 @@ jobs:
           composer config audit.block-insecure false
           composer install --no-interaction
           mv ../temp_git .git
+          # LIMPIEZA: Evitar errores de 'define' borrando tests internos
           rm -rf dev/tests
 
       - name: 3. Setup Magento + Create Product
         run: |
-          # Desactivamos rewrites para total compatibilidad con el servidor PHP embebido
+          # Desactivamos rewrites para que funcione con el servidor PHP embebido
           bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=0
           
           cat <<EOF > create_product.php
@@ -77,6 +78,7 @@ jobs:
           bin/magento cache:flush
 
       - name: 4. Iniciar Servidor Web
+        # Quitamos el timeout de Bash que daba Error 124
         run: php -S 127.0.0.1:8080 -t pub/ & 
 
       - name: 5. Test de Carrito (Playwright Robusto)
@@ -96,11 +98,11 @@ jobs:
           cat <<EOF > cart.spec.js
           const { test, expect } = require('@playwright/test');
           test('Añadir al carrito funciona', async ({ page }) => {
-            // Reintentos automáticos hasta que el servidor responda (máximo 60s)
+            // Reintentos automáticos para esperar a que el servidor PHP responda (máximo 90s)
             await expect(async () => {
               const response = await page.goto('/index.php/test-product.html');
               expect(response.status()).toBe(200);
-            }).toPass({ timeout: 60000 });
+            }).toPass({ timeout: 90000 });
             
             const addToCart = page.locator('#product-addtocart-button');
             await expect(addToCart).toBeVisible({ timeout: 45000 });
@@ -112,7 +114,7 @@ jobs:
           });
           EOF
           
-          npx playwright test cart.spec.js --timeout=120000
+          npx playwright test cart.spec.js --timeout=180000
 
       - name: Upload Playwright Report
         if: always()
@@ -121,7 +123,7 @@ jobs:
           name: playwright-report
           path: playwright-report/
 
-      - name: 6. Crear PR
+      - name: 6. Crear PR si pasó el test
         if: success()
         uses: peter-evans/create-pull-request@v6
         with:
