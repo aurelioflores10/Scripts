@@ -94,5 +94,5 @@ jobs:
             - Módulo `magento/module-services-id` agregado.
             - Base de Datos MariaDB 10.4 y Elasticsearch 7.17 verificados.
           branch: feature/magento-auto-install
-          base: main # O master, según el nombre de tu rama principal
+          base: master # O main, según el nombre de tu rama principal
           delete-branch: true
