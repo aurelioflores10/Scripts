@@ -1,4 +1,4 @@
-name: Instalar Magento dos
+name: Instalar Magento tres
 on: workflow_dispatch
 
 jobs:
@@ -6,6 +6,7 @@ jobs:
     runs-on: ubuntu-latest
     
     services:
+      # BASE DE DATOS (Versión 10.4 obligatoria para Magento 2.4.5)
       db:
         image: mariadb:10.4
         env:
@@ -14,6 +15,16 @@ jobs:
         ports:
           - 3306:3306
         options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+      # ELASTICSEARCH (Sin esto Magento 2.4.x no instala)
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+        env:
+          discovery.type: single-node
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 9200:9200
+        options: --health-cmd="curl http://localhost:9200/_cluster/health" --health-interval=10s --health-timeout=5s --health-retries=10
 
     steps:
       - name: Checkout del repositorio
@@ -44,7 +55,7 @@ jobs:
             magento/project-community-edition=2.4.5 . \
             --no-interaction --prefer-dist --no-audit
 
-      # PASO 3: Instalación de la Base de Datos
+      # PASO 3: Instalación de la Base de Datos y Búsqueda
       - name: 3. Setup Install (Crear Tablas)
         run: |
           bin/magento setup:install \
@@ -59,6 +70,9 @@ jobs:
             --admin-firstname=A \
             --admin-lastname=Z \
             --use-rewrites=1 \
+            --search-engine=elasticsearch7 \
+            --elasticsearch-host=127.0.0.1 \
+            --elasticsearch-port=9200 \
             --cleanup-database
 
       # PASO 4: Verificación Final
@@ -66,4 +80,4 @@ jobs:
         run: |
           echo "### ESTADO DE MODULOS ###"
           bin/magento module:status | grep Magento_Store
-          echo "¡Magento 2.4.5 instalado con éxito en el Runner!"
+          echo "¡Magento 2.4.5 con Elasticsearch instalado con éxito!"
