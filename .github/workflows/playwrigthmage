@@ -1,0 +1,85 @@
+name: Magento Install + Playwright Cart Test
+on: workflow_dispatch
+
+jobs:
+  test-and-pr:
+    runs-on: ubuntu-latest
+    
+    services:
+      db:
+        image: mariadb:10.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: magento_245
+        ports: ["3306:3306"]
+        options: --health-cmd="mysqladmin ping" --health-interval=10s
+
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+        env:
+          discovery.type: single-node
+        ports: ["9200:9200"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 1. Setup PHP & Node
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring
+          tools: composer:v2
+
+      - name: 2. Install Magento & Module
+        run: |
+          composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
+          mv .git ../temp_git
+          rm -rf ./* ./.* 2>/dev/null || true
+          composer create-project --repository-url=https://repo.magento.com magento/project-community-edition=2.4.5 . --no-install
+          composer require magento/module-services-id --no-interaction
+          composer install
+          mv ../temp_git .git
+
+      - name: 3. Setup Magento
+        run: |
+          bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=1
+          
+          # CREAR PRODUCTO POR CLI (Para que el test tenga qué comprar)
+          bin/magento sampledata:reset # Limpia si hubiera algo
+          # Creamos una categoría y un producto simple
+          bin/magento catalog:category:create --name="Test Category"
+          bin/magento catalog:product:create --sku="test-product" --name="Product Test Playwright" --price=10 --website-ids=1 --category-ids=3 --qty=100 --status=1 --visibility=4
+
+      - name: 4. Iniciar Servidor Web
+        run: php -S 127.0.0.1:8080 -t pub/ & 
+
+      - name: 5. Test de Carrito (Playwright)
+        run: |
+          npm install @playwright/test
+          npx playwright install chromium --with-deps
+          
+          cat <<EOF > cart.spec.js
+          const { test, expect } = require('@playwright/test');
+          test('Añadir al carrito funciona', async ({ page }) => {
+            // Ir directo a la página del producto que creamos
+            await page.goto('http://127.0.0.1test-product.html');
+            // Esperar al botón de carrito y hacer clic
+            const addToCart = page.locator('#product-addtocart-button');
+            await expect(addToCart).toBeVisible();
+            await addToCart.click();
+            // Verificar mensaje de éxito
+            await expect(page.locator('.message-success')).toContainText('You added Product Test Playwright to your shopping cart');
+          });
+          EOF
+          
+          npx playwright test cart.spec.js
+
+      - name: 6. Crear PR si el Test pasó
+        if: success()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: magento installed and cart verified"
+          title: "Magento 2.4.5 + Services ID (Tested)"
+          branch: feature/verified-install
