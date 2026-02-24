@@ -1,4 +1,4 @@
-name: Magento Install + Playwright Final Fix (No More 404)
+name: Magento Install + Playwright Final Fix
 on: workflow_dispatch
 
 jobs:
@@ -45,9 +45,9 @@ jobs:
           mv ../temp_git .git
           rm -rf dev/tests
 
-      - name: 3. Setup Magento + Create Product (Fix URL & Stock)
+      - name: 3. Setup Magento + Create Product
         run: |
-          # IMPORTANTE: base-url con puerto 8080 y barra final
+          # Desactivamos rewrites para total compatibilidad con el servidor PHP embebido
           bin/magento setup:install --db-host=127.0.0.1 --db-name=magento_245 --db-user=root --db-password=root --base-url=http://127.0.0.1 --search-engine=elasticsearch7 --elasticsearch-host=127.0.0.1 --elasticsearch-port=9200 --admin-user=admin --admin-password=Password123 --admin-email=admin@test.com --admin-firstname=A --admin-lastname=Z --use-rewrites=0
           
           cat <<EOF > create_product.php
@@ -62,7 +62,7 @@ jobs:
           \$product = \$objectManager->create(\Magento\Catalog\Model\Product::class);
           \$product->setSku('test-product')
               ->setName('Product Test Playwright')
-              ->setUrlKey('test-product') // Fuerza el slug para evitar 404
+              ->setUrlKey('test-product')
               ->setTypeId('simple')
               ->setAttributeSetId(4)
               ->setPrice(10)
@@ -71,18 +71,15 @@ jobs:
               ->setVisibility(4)
               ->setStatus(1)
               ->save();
-          echo "Producto creado con URL Key: test-product\n";
           EOF
           php create_product.php
           bin/magento indexer:reindex
           bin/magento cache:flush
 
       - name: 4. Iniciar Servidor Web
-        run: |
-          php -S 127.0.0.1:8080 -t pub/ & 
-          timeout 60s bash -c 'until curl -s http://127.0.0.1index.php > /dev/null; do sleep 2; done'
+        run: php -S 127.0.0.1:8080 -t pub/ & 
 
-      - name: 5. Test de Carrito (Fix URL Rewrites)
+      - name: 5. Test de Carrito (Playwright Robusto)
         run: |
           npm install @playwright/test
           npx playwright install chromium --with-deps
@@ -99,11 +96,14 @@ jobs:
           cat <<EOF > cart.spec.js
           const { test, expect } = require('@playwright/test');
           test('Añadir al carrito funciona', async ({ page }) => {
-            // FIX: Usamos /index.php/ delante para evitar el error 404 del servidor PHP embebido
-            await page.goto('/index.php/test-product.html', { waitUntil: 'networkidle', timeout: 90000 });
+            // Reintentos automáticos hasta que el servidor responda (máximo 60s)
+            await expect(async () => {
+              const response = await page.goto('/index.php/test-product.html');
+              expect(response.status()).toBe(200);
+            }).toPass({ timeout: 60000 });
             
             const addToCart = page.locator('#product-addtocart-button');
-            await expect(addToCart).toBeVisible({ timeout: 40000 });
+            await expect(addToCart).toBeVisible({ timeout: 45000 });
             await addToCart.click();
             
             const success = page.locator('.message-success');
