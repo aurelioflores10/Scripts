@@ -1,0 +1,105 @@
+name: Instalar Magento tres - Modulo y PR
+on: workflow_dispatch
+
+jobs:
+  install-and-pr:
+    runs-on: ubuntu-latest
+    
+    # Permisos de ESCRITURA para poder crear el Pull Request
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    services:
+      db:
+        image: mariadb:10.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: magento_245
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+        env:
+          discovery.type: single-node
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 9200:9200
+        options: --health-cmd="curl http://localhost:9200/_cluster/health" --health-interval=10s --health-timeout=5s --health-retries=10
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Necesario para que Git entienda la historia al crear el PR
+
+      # PASO 1: Configurar el entorno PHP
+      - name: 1. Configurar PHP 8.1
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring
+          tools: composer:v2
+
+      # PASO 2: Instalación de Magento + Módulo Extra
+      - name: 2. Crear proyecto y Agregar Modulo
+        run: |
+          # 1. Configurar llaves y bypass de seguridad
+          composer config -g http-basic.repo.magento.com ${{ secrets.M_PUB }} ${{ secrets.M_PRIV }}
+          composer config -g audit.block-insecure false
+          
+          # 2. EL BAILE DEL .GIT (Para evitar error de directorio no vacío)
+          # Movemos la carpeta .git afuera temporalmente
+          mv .git ../temp_git
+          rm -rf ./* ./.* 2>/dev/null || true
+          
+          # 3. Instalar Magento 2.4.5 en la raíz vacía
+          composer create-project --repository-url=https://repo.magento.com \
+            magento/project-community-edition=2.4.5 . \
+            --no-interaction --prefer-dist --no-audit
+          
+          # 4. REGRESAR .git para que GitHub reconozca el repo
+          mv ../temp_git .git
+          
+          # 5. INSTALAR EL MODULO QUE PEDISTE
+          composer require magento/module-services-id --no-interaction --no-audit
+
+      # PASO 3: Instalación de la Base de Datos y Búsqueda
+      - name: 3. Setup Install (Crear Tablas)
+        run: |
+          bin/magento setup:install \
+            --db-host=127.0.0.1 \
+            --db-name=magento_245 \
+            --db-user=root \
+            --db-password=root \
+            --base-url=http://127.0.0.1 \
+            --admin-user=admin \
+            --admin-password=Password123 \
+            --admin-email=admin@test.com \
+            --admin-firstname=A \
+            --admin-lastname=Z \
+            --use-rewrites=1 \
+            --search-engine=elasticsearch7 \
+            --elasticsearch-host=127.0.0.1 \
+            --elasticsearch-port=9200 \
+            --cleanup-database
+
+      # PASO 4: Crear el Pull Request con los archivos resultantes
+      - name: 4. Crear Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: install magento 2.4.5 and module-services-id"
+          title: "Magento 2.4.5 + Services ID Autoinstaller"
+          body: |
+            Instalación automática realizada en el Runner.
+            - Módulo `magento/module-services-id` instalado.
+            - Archivos `composer.json` y `composer.lock` actualizados.
+          branch: feature/magento-install-services-id
+          base: master # Configurado para tu rama master, mirrey
+          delete-branch: true
+          add-paths: |
+            composer.json
+            composer.lock
