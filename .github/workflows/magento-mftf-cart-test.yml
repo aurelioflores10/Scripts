@@ -1,0 +1,547 @@
+name: "Magento 2.4.5 + Module Services-ID + MFTF Cart Test + PR"
+on: workflow_dispatch
+
+jobs:
+  test-and-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    services:
+      db:
+        image: mariadb:10.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: magento_245
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+        env:
+          discovery.type: single-node
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd="curl -f http://localhost:9200/_cluster/health"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      # ─────────────────────────────────────────────
+      # CHECKOUT
+      # ─────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ─────────────────────────────────────────────
+      # PASO 1: PHP 8.1
+      # MFTF requiere las mismas extensiones que Magento
+      # ─────────────────────────────────────────────
+      - name: "1. Setup PHP 8.1"
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring, iconv
+          tools: composer:v2
+          ini-values: memory_limit=2G, max_execution_time=600
+
+      # ─────────────────────────────────────────────
+      # PASO 2: Instalar Magento 2.4.5
+      # MFTF viene incluido en vendor/ de Magento
+      # (magento/magento2-functional-testing-framework)
+      # ─────────────────────────────────────────────
+      - name: "2. Instalar Magento 2.4.5"
+        run: |
+          composer config -g http-basic.repo.magento.com "${{ secrets.M_PUB }}" "${{ secrets.M_PRIV }}"
+          composer config -g audit.block-insecure false
+          mv .git ../temp_git
+          rm -rf ./* ./.* 2>/dev/null || true
+          composer create-project \
+            --repository-url=https://repo.magento.com \
+            magento/project-community-edition=2.4.5 . \
+            --no-interaction --prefer-dist --no-audit
+          mv ../temp_git .git
+          chmod +x bin/magento
+
+          # Verificar que MFTF está instalado por Magento
+          echo "=== Verificando MFTF ==="
+          ls vendor/magento/magento2-functional-testing-framework/
+          vendor/bin/mftf --version
+
+      # ─────────────────────────────────────────────
+      # PASO 3: Instalar módulo magento/module-services-id
+      # ─────────────────────────────────────────────
+      - name: "3. Instalar módulo magento/module-services-id"
+        run: |
+          composer require magento/module-services-id --no-interaction --no-audit
+
+      # ─────────────────────────────────────────────
+      # PASO 4: Magento setup:install
+      # ─────────────────────────────────────────────
+      - name: "4. Magento setup:install"
+        run: |
+          bin/magento setup:install \
+            --db-host=127.0.0.1 \
+            --db-name=magento_245 \
+            --db-user=root \
+            --db-password=root \
+            --base-url=http://127.0.0.1:8080/ \
+            --search-engine=elasticsearch7 \
+            --elasticsearch-host=127.0.0.1 \
+            --elasticsearch-port=9200 \
+            --admin-user=admin \
+            --admin-password=Password123! \
+            --admin-email=admin@test.com \
+            --admin-firstname=Admin \
+            --admin-lastname=User \
+            --admin-use-security-key=0 \
+            --use-rewrites=0 \
+            --cleanup-database
+
+          # Habilitar módulo recién instalado
+          bin/magento module:enable Magento_ServicesId --clear-static-content
+          bin/magento setup:upgrade
+          bin/magento cache:flush
+
+      # ─────────────────────────────────────────────
+      # PASO 5: Crear producto de prueba
+      # ─────────────────────────────────────────────
+      - name: "5. Crear producto de prueba para MFTF"
+        run: |
+          cat > create_product.php << 'PHPEOF'
+          <?php
+          use Magento\Framework\App\Bootstrap;
+          require __DIR__ . '/app/bootstrap.php';
+
+          $bootstrap = Bootstrap::create(BP, $_SERVER);
+          $obj = $bootstrap->getObjectManager();
+
+          $state = $obj->get(\Magento\Framework\App\State::class);
+          $state->setAreaCode(\Magento\Framework\App\Area::AREA_ADMINHTML);
+
+          $product = $obj->create(\Magento\Catalog\Model\Product::class);
+          $product->setSku('test-product')
+              ->setName('Product Test MFTF')
+              ->setUrlKey('test-product')
+              ->setTypeId('simple')
+              ->setAttributeSetId(4)
+              ->setPrice(10.00)
+              ->setWebsiteIds([1])
+              ->setStockData([
+                  'use_config_manage_stock' => 0,
+                  'manage_stock' => 1,
+                  'is_in_stock' => 1,
+                  'qty' => 100
+              ])
+              ->setVisibility(\Magento\Catalog\Model\Product\Visibility::VISIBILITY_BOTH)
+              ->setStatus(\Magento\Catalog\Model\Product\Attribute\Source\Status::STATUS_ENABLED)
+              ->save();
+
+          echo "Producto 'test-product' creado exitosamente.\n";
+          PHPEOF
+
+          php create_product.php
+          bin/magento indexer:reindex
+          bin/magento cache:flush
+
+      # ─────────────────────────────────────────────
+      # PASO 6: Iniciar servidor PHP built-in
+      # MFTF necesita que Magento esté corriendo,
+      # igual que Selenium/Playwright
+      # ─────────────────────────────────────────────
+      - name: "6. Iniciar servidor PHP built-in"
+        run: |
+          nohup php -S 127.0.0.1:8080 -t pub/ phpserver/router.php > php_server.log 2>&1 &
+          echo "Esperando que el servidor esté listo..."
+          for i in $(seq 1 24); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/index.php/ 2>/dev/null || echo "000")
+            echo "  Intento $i/24 - HTTP: $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
+              echo "Servidor listo!"
+              break
+            fi
+            sleep 5
+          done
+          echo "HTTP producto: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/index.php/test-product.html)"
+
+      # ══════════════════════════════════════════════════════════
+      # PASO 7: CONFIGURAR MFTF
+      # ══════════════════════════════════════════════════════════
+
+      # ─────────────────────────────────────────────
+      # 7a. Instalar Chrome + ChromeDriver
+      # MFTF usa Codeception que internamente necesita
+      # ChromeDriver igual que Selenium, PERO:
+      # - No necesitas selenium-server JAR
+      # - MFTF lo orquesta todo vía Codeception
+      # ─────────────────────────────────────────────
+      - name: "7a. Instalar Chrome + ChromeDriver"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+
+          # Instalar Google Chrome
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+\.\d+')
+          CHROME_MAJOR=$(echo $CHROME_VERSION | cut -d. -f1)
+          echo "Chrome: $CHROME_VERSION (Major: $CHROME_MAJOR)"
+
+          # Instalar ChromeDriver compatible
+          DRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chromedriver-linux64.zip"
+          wget -q "$DRIVER_URL" -O chromedriver.zip 2>/dev/null || {
+            echo "Buscando versión compatible..."
+            LATEST_URL=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}")
+            DRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/${LATEST_URL}/linux64/chromedriver-linux64.zip"
+            wget -q "$DRIVER_URL" -O chromedriver.zip
+          }
+          unzip -o chromedriver.zip
+          sudo mv chromedriver-linux64/chromedriver /usr/local/bin/
+          sudo chmod +x /usr/local/bin/chromedriver
+          chromedriver --version
+
+      # ─────────────────────────────────────────────
+      # 7b. Configurar el .env de MFTF
+      #
+      # ┌──────────────────────────────────────────┐
+      # │ DIFERENCIA CLAVE CON SELENIUM:           │
+      # │                                          │
+      # │ Selenium: configuras el driver en Python │
+      # │           (Options, Service, webdriver)  │
+      # │                                          │
+      # │ MFTF: configuras TODO en un archivo .env │
+      # │       dev/tests/acceptance/.env          │
+      # │       y MFTF gestiona Codeception+driver │
+      # └──────────────────────────────────────────┘
+      # ─────────────────────────────────────────────
+      - name: "7b. Configurar .env de MFTF"
+        run: |
+          # MFTF usa dev/tests/acceptance/.env
+          # (copiamos desde el template incluido en Magento)
+          cp dev/tests/acceptance/.env.example dev/tests/acceptance/.env
+
+          # Sobreescribir con nuestros valores
+          cat > dev/tests/acceptance/.env << 'ENVEOF'
+          # ── URL de Magento (debe terminar en /) ──────────────────
+          MAGENTO_BASE_URL=http://127.0.0.1:8080/
+          MAGENTO_BACKEND_NAME=admin
+
+          # ── Credenciales admin ───────────────────────────────────
+          MAGENTO_ADMIN_USERNAME=admin
+          MAGENTO_ADMIN_PASSWORD=Password123!
+
+          # ── ChromeDriver ─────────────────────────────────────────
+          # MFTF le dice a Codeception dónde está ChromeDriver
+          # En Selenium lo hacías con: Service("/usr/local/bin/chromedriver")
+          SELENIUM_HOST=127.0.0.1
+          SELENIUM_PORT=4444
+          SELENIUM_PROTOCOL=http
+          SELENIUM_PATH=/wd/hub
+
+          # ── Browser ──────────────────────────────────────────────
+          BROWSER=chrome
+
+          # ── Elasticsearch ────────────────────────────────────────
+          ELASTICSEARCH_VERSION=7
+
+          # ── Módulo a testear ─────────────────────────────────────
+          MODULE_WHITELIST=Magento_ServicesId
+          ENVEOF
+
+          echo "=== .env configurado ==="
+          cat dev/tests/acceptance/.env
+
+      # ─────────────────────────────────────────────
+      # 7c. Crear el Test XML de MFTF
+      #
+      # ┌──────────────────────────────────────────┐
+      # │ DIFERENCIA CLAVE CON SELENIUM:           │
+      # │                                          │
+      # │ Selenium: escribes Python (.py)          │
+      # │   driver.get(url)                        │
+      # │   element.click()                        │
+      # │   assert "text" in element.text          │
+      # │                                          │
+      # │ MFTF: escribes XML declarativo           │
+      # │   <amOnPage url="..."/>                  │
+      # │   <click selector="..."/>                │
+      # │   <see userInput="..."/>                 │
+      # └──────────────────────────────────────────┘
+      # ─────────────────────────────────────────────
+      - name: "7c. Crear Test XML de MFTF"
+        run: |
+          # Crear la estructura de directorios del test personalizado
+          # MFTF busca tests en: app/code/<Vendor>/<Module>/Test/Mftf/
+          # o en dev/tests/acceptance/tests/functional/
+          mkdir -p dev/tests/acceptance/tests/functional/CartTest/Test
+          mkdir -p dev/tests/acceptance/tests/functional/CartTest/Page
+          mkdir -p dev/tests/acceptance/tests/functional/CartTest/Section
+
+          # ── PAGE: Definir la página del producto ─────────────────
+          # Equivalente a: driver.get('http://127.0.0.1:8080/index.php/test-product.html')
+          cat > dev/tests/acceptance/tests/functional/CartTest/Page/ProductPage.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <pages xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 xsi:noNamespaceSchemaLocation="urn:magento:mftf:Page/etc/PageObject.xsd">
+              <page name="ProductTestPage"
+                    url="/index.php/test-product.html"
+                    module="CartTest"
+                    area="storefront">
+              </page>
+          </pages>
+          XMLEOF
+
+          # ── SECTION: Selectores CSS/XPath ────────────────────────
+          # Equivalente a: By.ID("product-addtocart-button"), etc.
+          # En Selenium los selectores van EN el código Python.
+          # En MFTF van en archivos Section XML SEPARADOS (mejor organización).
+          cat > dev/tests/acceptance/tests/functional/CartTest/Section/ProductSection.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <sections xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:noNamespaceSchemaLocation="urn:magento:mftf:Page/etc/SectionObject.xsd">
+              <section name="AddToCartSection">
+                  <!-- Equivalente a: By.ID("product-addtocart-button") -->
+                  <element name="addToCartButton"
+                           type="button"
+                           selector="#product-addtocart-button"/>
+
+                  <!-- Equivalente a: By.CSS_SELECTOR(".message-success") -->
+                  <element name="successMessage"
+                           type="text"
+                           selector=".message-success"
+                           timeout="45"/>
+
+                  <!-- Equivalente a: By.CSS_SELECTOR(".counter-number") -->
+                  <element name="cartCounter"
+                           type="text"
+                           selector=".counter-number"
+                           timeout="30"/>
+              </section>
+          </sections>
+          XMLEOF
+
+          # ── TEST: La lógica del test en XML ──────────────────────
+          # Equivalente al archivo cart_test.py de Selenium
+          cat > dev/tests/acceptance/tests/functional/CartTest/Test/AddToCartTest.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <tests xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 xsi:noNamespaceSchemaLocation="urn:magento:mftf:Test/etc/testSchema.xsd">
+
+              <test name="AddProductToCartTest">
+                  <annotations>
+                      <features value="Cart"/>
+                      <stories value="Add product to cart"/>
+                      <title value="Agregar producto al carrito desde la página del producto"/>
+                      <description value="
+                          Verifica que un cliente puede agregar un producto simple al carrito.
+                          Equivalente al test de Selenium: test_agregar_producto_al_carrito
+                      "/>
+                      <severity value="CRITICAL"/>
+                      <group value="cart"/>
+                      <group value="services_id"/>
+                  </annotations>
+
+                  <!--
+                  ═════════════════════════���═════════════════════════════════
+                  EQUIVALENCIA MFTF vs SELENIUM:
+
+                  MFTF (XML)                        Selenium (Python)
+                  ──────────────────────────────    ─────────────────────────
+                  <amOnPage url="..."/>             driver.get(url)
+                  <waitForElement .../>             WebDriverWait(...).until(...)
+                  <click selector="..."/>           element.click()
+                  <see userInput="..."/>            assert "text" in element.text
+                  <waitForText .../>                polling manual con for loop
+                  <takeScreenshot/>                 driver.save_screenshot(...)
+                  ═══════════════════════════════════════════════════════════
+                  -->
+
+                  <!-- PASO 1: Navegar a la página del producto -->
+                  <!-- Selenium: driver.get(f"{BASE_URL}/index.php/test-product.html") -->
+                  <amOnPage url="{{ProductTestPage.url}}" stepKey="navigateToProduct"/>
+
+                  <!-- PASO 2: Esperar y verificar que el botón existe -->
+                  <!-- Selenium: wait.until(EC.element_to_be_clickable((By.ID, "..."))) -->
+                  <waitForElementVisible
+                      selector="{{AddToCartSection.addToCartButton}}"
+                      time="60"
+                      stepKey="waitForAddToCartButton"/>
+
+                  <!-- PASO 3: Click en Add to Cart -->
+                  <!-- Selenium: add_to_cart_btn.click() -->
+                  <click
+                      selector="{{AddToCartSection.addToCartButton}}"
+                      stepKey="clickAddToCart"/>
+
+                  <!-- PASO 4: Esperar mensaje de éxito -->
+                  <!-- Selenium: WebDriverWait(driver, 45).until(EC.visibility_of_element_located(...)) -->
+                  <waitForElementVisible
+                      selector="{{AddToCartSection.successMessage}}"
+                      time="45"
+                      stepKey="waitForSuccessMessage"/>
+
+                  <!-- PASO 5: Verificar texto del mensaje -->
+                  <!-- Selenium: assert "shopping cart" in success_msg.text.lower() -->
+                  <see
+                      userInput="shopping cart"
+                      selector="{{AddToCartSection.successMessage}}"
+                      stepKey="verifySuccessMessage"/>
+
+                  <!-- PASO 6: Verificar contador del carrito -->
+                  <!-- Selenium: polling manual con for loop de 30 intentos -->
+                  <waitForElementVisible
+                      selector="{{AddToCartSection.cartCounter}}"
+                      time="30"
+                      stepKey="waitForCartCounter"/>
+
+                  <waitForElementNotVisible
+                      selector=".counter-number[data-bind*='0']"
+                      time="30"
+                      stepKey="waitForCartCounterNotZero"/>
+
+                  <!-- PASO 7: Screenshot (en Selenium era driver.save_screenshot()) -->
+                  <takeScreenshot stepKey="takeSuccessScreenshot"/>
+
+              </test>
+          </tests>
+          XMLEOF
+
+          echo "=== Estructura de tests MFTF creada ==="
+          find dev/tests/acceptance/tests/functional/CartTest -type f
+
+      # ─────────────────────────────────────────────
+      # 7d. Iniciar ChromeDriver como servicio
+      #
+      # ┌──────────────────────────────────────────┐
+      # │ DIFERENCIA CON SELENIUM PURO:            │
+      # │                                          │
+      # │ Selenium (Python): chromedriver se       │
+      # │   lanza INTERNAMENTE al crear            │
+      # │   webdriver.Chrome(service=service)      │
+      # │                                          │
+      # │ MFTF (Codeception): chromedriver debe    │
+      # │   correr como proceso SEPARADO en        │
+      # │   puerto 4444, igual que un              │
+      # │   Selenium Server                        │
+      # └──────────────────────────────────────────┘
+      # ─────────────────────────────────────────────
+      - name: "7d. Iniciar ChromeDriver como servicio (puerto 4444)"
+        run: |
+          # Iniciar chromedriver en background en puerto 4444
+          nohup chromedriver \
+            --port=4444 \
+            --headless \
+            --log-path=chromedriver.log \
+            > chromedriver_stdout.log 2>&1 &
+
+          echo "ChromeDriver PID: $!"
+
+          # Esperar a que ChromeDriver esté listo
+          echo "Esperando ChromeDriver en puerto 4444..."
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:4444/status > /dev/null 2>&1; then
+              echo "ChromeDriver listo en intento $i"
+              break
+            fi
+            echo "  Intento $i/15..."
+            sleep 2
+          done
+
+          curl -s http://127.0.0.1:4444/status | python3 -m json.tool || echo "ChromeDriver status no disponible"
+
+      # ─────────────────────────────────────────────
+      # 7e. Compilar tests de MFTF
+      #
+      # MFTF convierte los XML → PHP (Codeception)
+      # Selenium no tiene este paso (el código Python
+      # se ejecuta directamente)
+      # ─────────────────────────────────────────────
+      - name: "7e. Compilar tests MFTF (XML → PHP/Codeception)"
+        run: |
+          # MFTF convierte los archivos XML en tests PHP ejecutables
+          # Este paso no existe en Selenium
+          vendor/bin/mftf build:project
+
+          # Generar solo nuestros tests (grupo "cart")
+          vendor/bin/mftf generate:tests --filter group:cart
+
+          echo "=== Tests generados en: ==="
+          ls dev/tests/acceptance/tests/functional/ 2>/dev/null || true
+          ls generated/code/ 2>/dev/null | head -20 || true
+
+      # ─────────────────────────────────────────────
+      # 7f. Ejecutar los tests MFTF
+      #
+      # Selenium: python -m pytest cart_test.py -v
+      # MFTF:     vendor/bin/mftf run:test AddProductToCartTest
+      # ─────────────────────────────────────────────
+      - name: "7f. Ejecutar test MFTF: AddProductToCartTest"
+        run: |
+          vendor/bin/mftf run:test AddProductToCartTest --remove
+
+      # ─────────────────────────────────────────────
+      # PASO 8: Artifacts
+      # MFTF genera reportes en dev/tests/acceptance/_output/
+      # Selenium generaba en selenium-report/
+      # ─────────────────────────────────────────────
+      - name: "8. Subir artifacts de debug"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-magento-mftf
+          retention-days: 7
+          path: |
+            dev/tests/acceptance/_output/
+            chromedriver.log
+            chromedriver_stdout.log
+            php_server.log
+            var/log/
+            var/report/
+
+      # ─────────────────────────────────────────────
+      # PASO 9: Pull Request
+      # ─────────────────────────────────────────────
+      - name: "9. Crear Pull Request"
+        if: success()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: Magento 2.4.5 + module-services-id (cart test verified with MFTF)"
+          title: "✅ Magento 2.4.5 Verified: Services-ID Module + Cart (MFTF)"
+          body: |
+            ## Resumen
+            Este PR fue generado automáticamente tras verificar exitosamente:
+
+            1. ✅ **Instalación de Magento 2.4.5** Community Edition
+            2. ✅ **Instalación del módulo** `magento/module-services-id`
+            3. ✅ **Test MFTF** — Agregar producto al carrito funciona correctamente
+
+            ### Framework utilizado
+            - **MFTF** (Magento Functional Testing Framework) — `vendor/magento/magento2-functional-testing-framework`
+            - Google Chrome (headless) + ChromeDriver
+            - Tests escritos en **XML declarativo** (no Python)
+            - Ejecutados con `vendor/bin/mftf run:test`
+
+            ### Test ejecutado
+            - `AddProductToCartTest` — Grupo: `cart`, `services_id`
+          branch: feature/magento-verified-cart-mftf
+          base: master
+          delete-branch: true
+          add-paths: |
+            composer.json
+            composer.lock
+            dev/tests/acceptance/tests/functional/CartTest/
