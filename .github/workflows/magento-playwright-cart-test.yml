@@ -1,0 +1,291 @@
+name: "Magento 2.4.5 + Module Services-ID + Playwright Cart Test + PR"
+on: workflow_dispatch
+
+jobs:
+  test-and-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    services:
+      db:
+        image: mariadb:10.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: magento_245
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+        env:
+          discovery.type: single-node
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd="curl -f http://localhost:9200/_cluster/health"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      # ─────────────────────────────────────────────
+      # CHECKOUT (con historial completo para el PR)
+      # ─────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ─────────────────────────────────────────────
+      # PASO 1: PHP + Node.js
+      # ─────────────────────────────────────────────
+      - name: "1. Setup PHP 8.1"
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring, iconv
+          tools: composer:v2
+          ini-values: memory_limit=2G, max_execution_time=600
+
+      - name: "1b. Setup Node.js 18"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      # ─────────────────────────────────────────────
+      # PASO 2: Instalar Magento 2.4.5
+      # ─────────────────────────────────────────────
+      - name: "2. Instalar Magento 2.4.5 (Estrategia .git segura)"
+        run: |
+          # Configurar credenciales de repo.magento.com
+          composer config -g http-basic.repo.magento.com "${{ secrets.M_PUB }}" "${{ secrets.M_PRIV }}"
+          composer config -g audit.block-insecure false
+
+          # Preservar .git moviéndolo fuera del workspace
+          mv .git ../temp_git
+
+          # Limpiar workspace completamente
+          rm -rf ./* ./.* 2>/dev/null || true
+
+          # Crear proyecto Magento en el directorio actual (ahora vacío)
+          composer create-project \
+            --repository-url=https://repo.magento.com \
+            magento/project-community-edition=2.4.5 . \
+            --no-interaction --prefer-dist --no-audit
+
+          # Restaurar .git para que GitHub Actions reconozca el repo
+          mv ../temp_git .git
+
+          # Permisos
+          chmod +x bin/magento
+
+      # ─────────────────────────────────────────────
+      # PASO 3: Instalar módulo magento/module-services-id
+      # ─────────────────────────────────────────────
+      - name: "3. Instalar módulo magento/module-services-id"
+        run: |
+          composer require magento/module-services-id --no-interaction --no-audit
+
+      # ─────────────────────────────────────────────
+      # PASO 4: Setup Install (crear tablas, admin, etc.)
+      # ─────────────────────────────────────────────
+      - name: "4. Magento setup:install"
+        run: |
+          bin/magento setup:install \
+            --db-host=127.0.0.1 \
+            --db-name=magento_245 \
+            --db-user=root \
+            --db-password=root \
+            --base-url=http://127.0.0.1:8080 \
+            --search-engine=elasticsearch7 \
+            --elasticsearch-host=127.0.0.1 \
+            --elasticsearch-port=9200 \
+            --admin-user=admin \
+            --admin-password=Password123 \
+            --admin-email=admin@test.com \
+            --admin-firstname=Admin \
+            --admin-lastname=User \
+            --use-rewrites=0 \
+            --cleanup-database
+
+      # ─────────────────────────────────────────────
+      # PASO 5: Crear producto de prueba
+      # ─────────────────────────────────────────────
+      - name: "5. Crear producto de prueba para Playwright"
+        run: |
+          cat > create_product.php << 'PHPEOF'
+          <?php
+          use Magento\Framework\App\Bootstrap;
+          require __DIR__ . '/app/bootstrap.php';
+
+          $bootstrap = Bootstrap::create(BP, $_SERVER);
+          $obj = $bootstrap->getObjectManager();
+
+          $state = $obj->get(\Magento\Framework\App\State::class);
+          $state->setAreaCode(\Magento\Framework\App\Area::AREA_ADMINHTML);
+
+          $product = $obj->create(\Magento\Catalog\Model\Product::class);
+          $product->setSku('test-product')
+              ->setName('Product Test Playwright')
+              ->setUrlKey('test-product')
+              ->setTypeId('simple')
+              ->setAttributeSetId(4)
+              ->setPrice(10.00)
+              ->setWebsiteIds([1])
+              ->setStockData([
+                  'use_config_manage_stock' => 0,
+                  'manage_stock' => 1,
+                  'is_in_stock' => 1,
+                  'qty' => 100
+              ])
+              ->setVisibility(\Magento\Catalog\Model\Product\Visibility::VISIBILITY_BOTH)
+              ->setStatus(\Magento\Catalog\Model\Product\Attribute\Source\Status::STATUS_ENABLED)
+              ->save();
+
+          echo "Producto 'test-product' creado exitosamente.\n";
+          PHPEOF
+
+          php create_product.php
+          bin/magento indexer:reindex
+          bin/magento cache:flush
+
+      # ─────────────────────────────────────────────
+      # PASO 6: Levantar servidor web
+      # ─────────────────────────────────────────────
+      - name: "6. Iniciar servidor PHP built-in"
+        run: |
+          nohup php -S 127.0.0.1:8080 -t pub/ phpserver/router.php > php_server.log 2>&1 &
+          echo "Esperando que el servidor esté listo..."
+
+          # Esperar hasta 2 minutos a que Magento responda
+          for i in $(seq 1 24); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/index.php/ 2>/dev/null || echo "000")
+            echo "  Intento $i/24 - HTTP: $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
+              echo "Servidor listo!"
+              break
+            fi
+            sleep 5
+          done
+
+          # Verificar que la página del producto responde
+          PRODUCT_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/index.php/test-product.html 2>/dev/null || echo "000")
+          echo "Producto HTTP: $PRODUCT_CODE"
+
+      # ─────────────────────────────────────────────
+      # PASO 7: Test Playwright - Agregar al carrito
+      # ─────────────────────────────────────────────
+      - name: "7. Instalar Playwright"
+        run: |
+          npm init -y
+          npm install @playwright/test
+          npx playwright install chromium --with-deps
+
+      - name: "7b. Crear configuración y test de Playwright"
+        run: |
+          cat > playwright.config.js << 'PWCFG'
+          const { defineConfig } = require('@playwright/test');
+          module.exports = defineConfig({
+            testDir: '.',
+            testMatch: 'cart.spec.js',
+            timeout: 180000,
+            retries: 1,
+            use: {
+              baseURL: 'http://127.0.0.1:8080',
+              screenshot: 'on',
+              trace: 'on-first-retry',
+              headless: true,
+            },
+            reporter: [['html', { open: 'never' }]],
+          });
+          PWCFG
+
+          cat > cart.spec.js << 'PWTEST'
+          const { test, expect } = require('@playwright/test');
+
+          test('Agregar producto al carrito de Magento', async ({ page }) => {
+            // Navegar a la página del producto (sin rewrites, usando index.php)
+            await page.goto('/index.php/test-product.html', {
+              waitUntil: 'networkidle',
+              timeout: 90000,
+            });
+
+            // Esperar a que el botón "Add to Cart" sea visible
+            const addToCartBtn = page.locator('#product-addtocart-button');
+            await expect(addToCartBtn).toBeVisible({ timeout: 60000 });
+
+            // Hacer clic en "Add to Cart"
+            await addToCartBtn.click();
+
+            // Verificar el mensaje de éxito de Magento
+            const successMessage = page.locator('.message-success');
+            await expect(successMessage).toBeVisible({ timeout: 45000 });
+            await expect(successMessage).toContainText('shopping cart', { ignoreCase: true });
+
+            // Verificar que el contador del carrito se actualizó
+            const cartCounter = page.locator('.counter-number');
+            await expect(cartCounter).toBeVisible({ timeout: 30000 });
+            await expect(cartCounter).not.toHaveText('0');
+          });
+          PWTEST
+
+      - name: "7c. Ejecutar test de Playwright"
+        run: npx playwright test cart.spec.js --reporter=html
+
+      # ─────────────────────────────────────────────
+      # PASO 8: Debug artifacts (siempre, incluso si falla)
+      # ─────────────────────────────────────────────
+      - name: "8. Subir artifacts de debug"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-magento-playwright
+          retention-days: 7
+          path: |
+            playwright-report/
+            test-results/
+            php_server.log
+            var/log/
+            var/report/
+
+      # ─────────────────────────────────────────────
+      # PASO 9: Crear PR si los tests pasaron
+      # ─────────────────────────────────────────────
+      - name: "9. Crear Pull Request"
+        if: success()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: Magento 2.4.5 + module-services-id (cart test verified)"
+          title: "✅ Magento 2.4.5 Verified: Services-ID Module + Cart Functionality"
+          body: |
+            ## Resumen
+            Este PR fue generado automáticamente tras verificar exitosamente:
+
+            1. ✅ **Instalación de Magento 2.4.5** Community Edition
+            2. ✅ **Instalación del módulo** `magento/module-services-id`
+            3. ✅ **Test Playwright** — Agregar producto al carrito funciona correctamente
+
+            ### Archivos incluidos
+            - `composer.json` — Configuración de Magento 2.4.5 + Services-ID
+            - `composer.lock` — Lock file con dependencias exactas
+
+            ### Test ejecutado
+            - Navegación a página de producto
+            - Click en botón `#product-addtocart-button`
+            - Verificación de mensaje de éxito
+            - Verificación de contador del carrito
+          branch: feature/magento-verified-cart
+          base: master
+          delete-branch: true
+          add-paths: |
+            composer.json
+            composer.lock
