@@ -1,0 +1,412 @@
+name: "Magento 2.4.5 + Module Services-ID + Selenium Cart Test + PR"
+on: workflow_dispatch
+
+jobs:
+  test-and-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    services:
+      db:
+        image: mariadb:10.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: magento_245
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+        env:
+          discovery.type: single-node
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd="curl -f http://localhost:9200/_cluster/health"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      # ─────────────────────────────────────────────
+      # CHECKOUT
+      # ─────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ─────────────────────────────────────────────
+      # PASO 1: PHP (igual que Playwright)
+      # ─────────────────────────────────────────────
+      - name: "1. Setup PHP 8.1"
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          extensions: bcmath, gd, intl, pdo_mysql, soap, zip, sockets, mbstring, iconv
+          tools: composer:v2
+          ini-values: memory_limit=2G, max_execution_time=600
+
+      # ─────────────────────────────────────────────
+      # PASO 1b: Python en vez de Node.js  ◄── CAMBIO
+      # ─────────────────────────────────────────────
+      - name: "1b. Setup Python 3.11"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ─────────────────────────────────────────────
+      # PASOS 2-6: IDÉNTICOS A PLAYWRIGHT
+      # (Magento install, módulo, producto, servidor)
+      # ─────────────────────────────────────────────
+      - name: "2. Instalar Magento 2.4.5 (Estrategia .git segura)"
+        run: |
+          composer config -g http-basic.repo.magento.com "${{ secrets.M_PUB }}" "${{ secrets.M_PRIV }}"
+          composer config -g audit.block-insecure false
+          mv .git ../temp_git
+          rm -rf ./* ./.* 2>/dev/null || true
+          composer create-project \
+            --repository-url=https://repo.magento.com \
+            magento/project-community-edition=2.4.5 . \
+            --no-interaction --prefer-dist --no-audit
+          mv ../temp_git .git
+          chmod +x bin/magento
+
+      - name: "3. Instalar módulo magento/module-services-id"
+        run: |
+          composer require magento/module-services-id --no-interaction --no-audit
+
+      - name: "4. Magento setup:install"
+        run: |
+          bin/magento setup:install \
+            --db-host=127.0.0.1 \
+            --db-name=magento_245 \
+            --db-user=root \
+            --db-password=root \
+            --base-url=http://127.0.0.1:8080 \
+            --search-engine=elasticsearch7 \
+            --elasticsearch-host=127.0.0.1 \
+            --elasticsearch-port=9200 \
+            --admin-user=admin \
+            --admin-password=Password123 \
+            --admin-email=admin@test.com \
+            --admin-firstname=Admin \
+            --admin-lastname=User \
+            --use-rewrites=0 \
+            --cleanup-database
+
+      - name: "5. Crear producto de prueba para Selenium"
+        run: |
+          cat > create_product.php << 'PHPEOF'
+          <?php
+          use Magento\Framework\App\Bootstrap;
+          require __DIR__ . '/app/bootstrap.php';
+
+          $bootstrap = Bootstrap::create(BP, $_SERVER);
+          $obj = $bootstrap->getObjectManager();
+
+          $state = $obj->get(\Magento\Framework\App\State::class);
+          $state->setAreaCode(\Magento\Framework\App\Area::AREA_ADMINHTML);
+
+          $product = $obj->create(\Magento\Catalog\Model\Product::class);
+          $product->setSku('test-product')
+              ->setName('Product Test Selenium')
+              ->setUrlKey('test-product')
+              ->setTypeId('simple')
+              ->setAttributeSetId(4)
+              ->setPrice(10.00)
+              ->setWebsiteIds([1])
+              ->setStockData([
+                  'use_config_manage_stock' => 0,
+                  'manage_stock' => 1,
+                  'is_in_stock' => 1,
+                  'qty' => 100
+              ])
+              ->setVisibility(\Magento\Catalog\Model\Product\Visibility::VISIBILITY_BOTH)
+              ->setStatus(\Magento\Catalog\Model\Product\Attribute\Source\Status::STATUS_ENABLED)
+              ->save();
+
+          echo "Producto 'test-product' creado exitosamente.\n";
+          PHPEOF
+
+          php create_product.php
+          bin/magento indexer:reindex
+          bin/magento cache:flush
+
+      - name: "6. Iniciar servidor PHP built-in"
+        run: |
+          nohup php -S 127.0.0.1:8080 -t pub/ phpserver/router.php > php_server.log 2>&1 &
+          echo "Esperando que el servidor esté listo..."
+          for i in $(seq 1 24); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/index.php/ 2>/dev/null || echo "000")
+            echo "  Intento $i/24 - HTTP: $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
+              echo "Servidor listo!"
+              break
+            fi
+            sleep 5
+          done
+          PRODUCT_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/index.php/test-product.html 2>/dev/null || echo "000")
+          echo "Producto HTTP: $PRODUCT_CODE"
+
+      # ══════════════════════════════════════════════════════════
+      # PASO 7: AQUÍ EMPIEZA LO DIFERENTE — SELENIUM
+      # ══════════════════════════════════════════════════════════
+
+      # ─────────────────────────────────────────────
+      # 7a. Instalar Chrome + ChromeDriver + Selenium
+      # En Playwright: 1 comando instalaba todo
+      # En Selenium: necesitas 3 cosas separadas
+      # ─────────────────────────────────────────────
+      - name: "7. Instalar Chrome + ChromeDriver + Selenium"
+        run: |
+          # ╔══════════════════════════════════════════════════╗
+          # ║ BINARIO 1: Google Chrome (el navegador)          ║
+          # ║ Equivalente Playwright: npx playwright install   ║
+          # ║                         chromium                 ║
+          # ╚══════════════════════════════════════════════════╝
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+          # Verificar versión de Chrome instalada
+          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+\.\d+')
+          echo "Chrome instalado: $CHROME_VERSION"
+
+          # ╔══════════════════════════════════════════════════╗
+          # ║ BINARIO 2: ChromeDriver (el TRADUCTOR)           ║
+          # ║ ⚠️  ESTO NO EXISTE EN PLAYWRIGHT                ║
+          # ║ Debe coincidir con la versión de Chrome          ║
+          # ╚══════════════════════════════════════════════════╝
+          CHROME_MAJOR=$(echo $CHROME_VERSION | cut -d. -f1)
+          DRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chromedriver-linux64.zip"
+
+          # Si la URL exacta falla, buscar la versión más cercana
+          wget -q "$DRIVER_URL" -O chromedriver.zip 2>/dev/null || {
+            echo "Buscando versión compatible de ChromeDriver..."
+            LATEST_URL=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}")
+            DRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/${LATEST_URL}/linux64/chromedriver-linux64.zip"
+            wget -q "$DRIVER_URL" -O chromedriver.zip
+          }
+
+          unzip -o chromedriver.zip
+          sudo mv chromedriver-linux64/chromedriver /usr/local/bin/
+          sudo chmod +x /usr/local/bin/chromedriver
+          chromedriver --version
+
+          # ╔══════════════════════════════════════════════════╗
+          # ║ LIBRERÍA: Selenium + Pytest                      ║
+          # ║ Equivalente Playwright: npm install              ║
+          # ║                         @playwright/test         ║
+          # ╚══════════════════════════════════════════════════╝
+          pip install selenium pytest pytest-html
+
+      # ───────��─────────────────────────────────────
+      # 7b. Crear el test (Python en vez de JavaScript)
+      # ─────────────────────────────────────────────
+      - name: "7b. Crear test de Selenium"
+        run: |
+          cat > cart_test.py << 'PYTEST'
+          """
+          Test equivalente al cart.spec.js de Playwright
+          pero usando Selenium + Pytest
+          """
+          import pytest
+          import time
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+
+
+          @pytest.fixture
+          def driver():
+              """
+              Configura Chrome en modo headless.
+
+              DIFERENCIA CLAVE CON PLAYWRIGHT:
+              ┌─────────────────────────────────────────────────┐
+              │ Playwright: automático, solo dices headless:true│
+              │ Selenium: tú configuras Chrome Options + Service│
+              │           + le dices DÓNDE está chromedriver    │
+              └─────────────────────────────────────────────────┘
+              """
+              chrome_options = Options()
+              chrome_options.add_argument("--headless=new")
+              chrome_options.add_argument("--no-sandbox")
+              chrome_options.add_argument("--disable-dev-shm-usage")
+              chrome_options.add_argument("--disable-gpu")
+              chrome_options.add_argument("--window-size=1920,1080")
+
+              # Service le dice a Selenium DÓNDE está chromedriver
+              service = Service("/usr/local/bin/chromedriver")
+
+              # Aquí es donde Selenium:
+              # 1. Lanza chromedriver (el traductor)
+              # 2. chromedriver lanza chrome (el navegador)
+              # 3. Se establece: test ──HTTP──► chromedriver ──CDP──► chrome
+              driver = webdriver.Chrome(service=service, options=chrome_options)
+              driver.implicitly_wait(10)
+
+              yield driver
+
+              # Al terminar, cerrar TODO
+              driver.quit()
+
+
+          def test_agregar_producto_al_carrito(driver):
+              """
+              EQUIVALENCIA LÍNEA POR LÍNEA:
+
+              Playwright:                          Selenium:
+              ──────────                           ────────
+              page.goto('/index.php/...')           driver.get('http://...')
+              page.locator('#btn')                  driver.find_element(By.ID, 'btn')
+              await expect(btn).toBeVisible()       WebDriverWait(...).until(EC.visibility...)
+              await btn.click()                     btn.click()
+              await expect(msg).toBeVisible()       WebDriverWait(...).until(EC.visibility...)
+              await expect(msg).toContainText()     assert 'text' in msg.text
+              """
+
+              BASE_URL = "http://127.0.0.1:8080"
+
+              # ──────────────────────────────────────────────
+              # Equivalente a: page.goto('/index.php/test-product.html')
+              # ──────────────────────────────────────────────
+              print("Navegando a la página del producto...")
+              driver.get(f"{BASE_URL}/index.php/test-product.html")
+
+              # ──────────────────────────────────────────────
+              # Equivalente a:
+              #   const btn = page.locator('#product-addtocart-button')
+              #   await expect(btn).toBeVisible({ timeout: 60000 })
+              #
+              # DIFERENCIA: Playwright auto-espera.
+              #             Selenium necesita WebDriverWait EXPLÍCITO.
+              # ──────────────────────────────────────────────
+              wait = WebDriverWait(driver, 60)
+              add_to_cart_btn = wait.until(
+                  EC.element_to_be_clickable(
+                      (By.ID, "product-addtocart-button")
+                  )
+              )
+              print("Botón 'Add to Cart' encontrado y clickeable")
+
+              # ──────────────────────────────────────────────
+              # Equivalente a: await addToCartBtn.click()
+              # ──────────────────────────────────────────────
+              add_to_cart_btn.click()
+              print("Click en 'Add to Cart' realizado")
+
+              # ──────────────────────────────────────────────
+              # Equivalente a:
+              #   await expect(page.locator('.message-success'))
+              #     .toBeVisible({ timeout: 45000 })
+              #   await expect(successMessage)
+              #     .toContainText('shopping cart')
+              # ─────────────────────────────────���────────────
+              success_msg = WebDriverWait(driver, 45).until(
+                  EC.visibility_of_element_located(
+                      (By.CSS_SELECTOR, ".message-success")
+                  )
+              )
+              assert "shopping cart" in success_msg.text.lower(), \
+                  f"Mensaje inesperado: {success_msg.text}"
+              print(f"Mensaje de éxito: {success_msg.text}")
+
+              # ──────────────────────────────────────────────
+              # Equivalente a:
+              #   await expect(page.locator('.counter-number'))
+              #     .not.toHaveText('0')
+              # ──────────────────────────────────────────────
+              cart_counter = WebDriverWait(driver, 30).until(
+                  EC.visibility_of_element_located(
+                      (By.CSS_SELECTOR, ".counter-number")
+                  )
+              )
+
+              # Selenium no tiene auto-retry para verificar texto.
+              # Hay que hacer polling manual.
+              for attempt in range(30):
+                  counter_text = cart_counter.text.strip()
+                  if counter_text and counter_text != "0":
+                      break
+                  time.sleep(1)
+                  # Re-buscar el elemento por si el DOM cambió
+                  cart_counter = driver.find_element(
+                      By.CSS_SELECTOR, ".counter-number"
+                  )
+
+              assert counter_text != "0", \
+                  f"El contador del carrito sigue en: {counter_text}"
+              print(f"Contador del carrito: {counter_text}")
+
+              # ──────────────────────────────────────────────
+              # Tomar screenshot (en Playwright es automático con screenshot:'on')
+              # En Selenium es manual
+              # ──────────────────────────────────────────────
+              driver.save_screenshot("cart_test_success.png")
+              print("TEST PASSED ✅")
+          PYTEST
+
+      # ─────────────────────────────────────────────
+      # 7c. Ejecutar el test
+      # ─────────────────────────────────────────────
+      - name: "7c. Ejecutar test de Selenium"
+        run: python -m pytest cart_test.py -v --html=selenium-report/report.html --self-contained-html
+
+      # ─────────────────────────────────────────────
+      # PASO 8: Artifacts
+      # ─────────────────────────────────────────────
+      - name: "8. Subir artifacts de debug"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-magento-selenium
+          retention-days: 7
+          path: |
+            selenium-report/
+            cart_test_success.png
+            php_server.log
+            var/log/
+            var/report/
+
+      # ─────────────────────────────────────────────
+      # PASO 9: PR (igual que Playwright)
+      # ─────────────────────────────────────────────
+      - name: "9. Crear Pull Request"
+        if: success()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: Magento 2.4.5 + module-services-id (cart test verified with Selenium)"
+          title: "✅ Magento 2.4.5 Verified: Services-ID Module + Cart (Selenium)"
+          body: |
+            ## Resumen
+            Este PR fue generado automáticamente tras verificar exitosamente:
+
+            1. ✅ **Instalación de Magento 2.4.5** Community Edition
+            2. ✅ **Instalación del módulo** `magento/module-services-id`
+            3. ✅ **Test Selenium** — Agregar producto al carrito funciona correctamente
+
+            ### Test ejecutado con
+            - Google Chrome (headless) + ChromeDriver + Selenium + Pytest
+          branch: feature/magento-verified-cart-selenium
+          base: master
+          delete-branch: true
+          add-paths: |
+            composer.json
+            composer.lock
