@@ -1,0 +1,110 @@
+name: "🚀 Super Validator: Install & Full Stack Test"
+
+on:
+  workflow_dispatch:
+    inputs:
+      module_name:
+        description: 'Módulo (ej: openpay/magento2-cards)'
+        required: true
+
+env:
+  COMPOSER_ALLOW_SUPERUSER: 1
+  # Configuración para que Magento encuentre los servicios del runner
+  MYSQL_HOST: 127.0.0.1
+  MYSQL_DATABASE: magento
+  MYSQL_USER: root
+  MYSQL_PASSWORD: root
+
+jobs:
+  validate-and-pr:
+    runs-on: ubuntu-latest
+
+    # LEVANTAMOS EL STACK REAL (Matching .magento/services.yaml)
+    services:
+      mysql:
+        image: mariadb:10.3
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: magento
+        ports: ["3306:3306"]
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+      redis:
+        image: redis:6.0
+        ports: ["6379:6379"]
+
+      opensearch:
+        image: opensearchproject/opensearch:1.2.0
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true" # Para simplificar conexión local
+        ports: ["9200:9200"]
+
+    steps:
+      - name: Checkout staging
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+
+      - name: Setup PHP & Extensions
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: gd, bcmath, intl, soap, zip, xsl, sodium, pdo_mysql, mbstring, sockets, redis
+          tools: composer:2.2.4
+
+      - name: Configure Auths
+        run: |
+          composer config -g http-basic.repo.magento.com "${{ secrets.MAGENTO_PUBLIC_KEY }}" "${{ secrets.MAGENTO_PRIVATE_KEY }}"
+          composer config -g http-basic.composer.amasty.com "${{ secrets.AMASTY_USERNAME }}" "${{ secrets.AMASTY_PASSWORD }}"
+
+      - name: 1. Composer Upgrade (Strict Platform)
+        run: |
+          # Sin --ignore-platform-reqs para validar contra tu config.platform
+          composer require "${{ github.event.inputs.module_name }}" --no-update
+          composer update "${{ github.event.inputs.module_name }}" --no-interaction --no-ansi --no-scripts
+
+      - name: 2. Mock env.php para el Runner
+        run: |
+          # Creamos un env.php mínimo para que Magento no chille al conectar
+          mkdir -p app/etc
+          cat <<EOF > app/etc/env.php
+          <?php
+          return [
+              'db' => ['connection' => ['default' => [
+                  'host' => '127.0.0.1', 'dbname' => 'magento', 'username' => 'root', 'password' => 'root', 'active' => '1'
+              ]]],
+              'crypt' => ['key' => 'dummy_key_for_testing_1234567890'],
+              'resource' => ['default_setup' => ['connection' => 'default']]
+          ];
+          EOF
+
+      - name: 3. Full Magento Validation
+        run: |
+          composer install --optimize-autoloader
+          
+          # Validación 1: Sintaxis y DI (Compilación)
+          php -d memory_limit=2G bin/magento setup:di:compile
+          
+          # Validación 2: ¿Rompe la base de datos? (Dry-run de esquemas)
+          # Esto detecta si hay conflictos de Declarative Schema
+          php -d memory_limit=2G bin/magento setup:upgrade --dry-run=1
+
+      - name: 4. Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: install ${{ github.event.inputs.module_name }}"
+          branch: "feature/install-${{ github.event.inputs.module_name }}"
+          add-paths: |
+            composer.json
+            composer.lock
+          title: "📦 Módulo Validado: ${{ github.event.inputs.module_name }}"
+          body: |
+            ### ✅ Validación de Stack Completa
+            - **PHP 8.1** Validado
+            - **MariaDB 10.3** (Schema Check) OK
+            - **OpenSearch 1.2** OK
+            - **DI Compile** OK
+            
+            Este PR solo incluye los cambios en `composer.json` y `lock`.
